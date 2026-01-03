@@ -1,0 +1,2 @@
+processes,lock_free_ops,coarse_grained_ops,fine_grained_ops,speedup
+16,2.28571e+07,1.45455e+07,1.17647e+07,1.57143

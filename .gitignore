@@ -1,0 +1,53 @@
+# Archivos compilados
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Ejecutables
+poet_simulator
+poet_benchmark
+*.out
+
+# Directorios de build
+build/
+cmake_build/
+dist/
+
+# Archivos temporales del editor
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/settings.json
+.vscode/launch.json
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Archivos CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Dependencias
+*.depend
+*.d
+
+# Archivos de profiling/debug
+*.gch
+*.pch
+*.prof
+*.callgrind*
