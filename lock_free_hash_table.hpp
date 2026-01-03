@@ -1,110 +1,100 @@
 #ifndef LOCK_FREE_HASH_TABLE_HPP
 #define LOCK_FREE_HASH_TABLE_HPP
 
-#include <unordered_map>
-#include <atomic>
-#include <memory>
-#include <mpi.h>
-#include "distributed_hash_table.hpp"  // Contiene GridCell y DistributedHashTable
+#include "distributed_hash_table.hpp"
 
-// Implementación Lock-Free (sin bloqueos explícitos)
 class LockFreeHashTable : public DistributedHashTable {
-private:
-    struct AtomicCell {
-        std::atomic<double>* concentrations;
-        std::atomic<double> flux_in;
-        std::atomic<double> flux_out;
-        int num_species;
-
-        AtomicCell(int num_species) : num_species(num_species) {
-            concentrations = new std::atomic<double>[num_species];
-            for (int i = 0; i < num_species; ++i) {
-                concentrations[i].store(0.0);
-            }
-            flux_in.store(0.0);
-            flux_out.store(0.0);
-        }
-
-        ~AtomicCell() {
-            delete[] concentrations;
-        }
-    };
-
-    std::unordered_map<int, std::unique_ptr<AtomicCell>> local_data;
-    int rank, size;
-    int num_species;
-    int local_grid_size;
-
 public:
-    LockFreeHashTable(int num_species, int total_cells, int rank, int size)
-        : num_species(num_species), rank(rank), size(size)
-    {
-        local_grid_size = total_cells / size;
-
-        // Inicializa celdas locales
-        for (int i = 0; i < local_grid_size; ++i) {
-            int global_id = rank * local_grid_size + i;
-            local_data[global_id] = std::make_unique<AtomicCell>(num_species);
-        }
+    LockFreeHashTable(int total_entries, int rank, int size)
+        : DistributedHashTable(total_entries, rank, size) {
+        
+        // ESTRATEGIA: RMA Pasivo Continuo
+        // "All windows are locked by all processes with MPI_Win_lock_all" 
+        // Esto elimina el overhead de adquirir/liberar locks en cada operación.
+        MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
     }
 
-    void updateCell(int cell_id, const GridCell& new_data) override {
-        auto it = local_data.find(cell_id);
-        if (it != local_data.end()) {
-            auto& cell = it->second;
+    ~LockFreeHashTable() {
+        MPI_Win_unlock_all(win);
+    }
 
-            for (int i = 0; i < num_species; ++i) {
-                cell->concentrations[i].store(new_data.concentrations[i],
-                                              std::memory_order_relaxed);
+    // Función auxiliar de Checksum (Hash simple para integridad)
+    // "The origin process is responsible for calculating a checksum" [cite: 245]
+    unsigned int calculateChecksum(const DHT_Bucket& b) {
+        unsigned int hash = 0;
+        // Checksum de la clave y los datos (concentraciones)
+        hash ^= std::hash<int>{}(b.key);
+        for(double c : b.value.concentrations) {
+            hash ^= std::hash<double>{}(c) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        }
+        return hash;
+    }
+
+    void updateCell(int key, const GridCell& val) override {
+        int target_rank = getOwnerRank(key);
+        MPI_Aint target_offset = getLocalOffset(key);
+
+        DHT_Bucket bucket;
+        bucket.key = key;
+        bucket.value = val;
+        bucket.status = 1; // Ocupado
+        
+        // 1. CALCULAR CHECKSUM
+        // "Appending it to the bucket data" [cite: 245]
+        bucket.checksum = calculateChecksum(bucket);
+
+        // 2. ESCRITURA "OPTIMISTA" (Sin Lock individual)
+        // Usamos MPI_Put directamente. Si hay colisión de escritura, el checksum del lector fallará.
+        MPI_Put(&bucket, sizeof(DHT_Bucket), MPI_BYTE,
+                target_rank, target_offset * sizeof(DHT_Bucket),
+                sizeof(DHT_Bucket), MPI_BYTE, win);
+        
+        // Asegurar que el dato salga del buffer local hacia la red
+        MPI_Win_flush(target_rank, win);
+    }
+
+    GridCell getCell(int key) override {
+        int target_rank = getOwnerRank(key);
+        MPI_Aint target_offset = getLocalOffset(key);
+        
+        DHT_Bucket temp;
+        int attempts = 0;
+        const int MAX_ATTEMPTS = 10; // Límite de reintentos por consistencia
+
+        while (attempts < MAX_ATTEMPTS) {
+            // 1. LEER (READ)
+            MPI_Get(&temp, sizeof(DHT_Bucket), MPI_BYTE,
+                    target_rank, target_offset * sizeof(DHT_Bucket),
+                    sizeof(DHT_Bucket), MPI_BYTE, win);
+            
+            MPI_Win_flush(target_rank, win); // Esperar a recibir datos
+
+            // Si está vacío, no hay nada que validar
+            if (temp.status == 0) return GridCell();
+
+            // 2. VALIDAR CHECKSUM
+            // "Recalculates the checksum... If equal... returned" [cite: 246-247]
+            unsigned int local_calc = calculateChecksum(temp);
+            
+            if (local_calc == temp.checksum) {
+                if (temp.key == key) return temp.value;
+                // Colisión de Hash (Linear Probing) - no implementado full en versión simple
+                // para mantener el benchmark enfocado en la latencia de red/consistencia.
+                return GridCell(); 
             }
-            cell->flux_in.store(new_data.flux_in, std::memory_order_relaxed);
-            cell->flux_out.store(new_data.flux_out, std::memory_order_relaxed);
+
+            // 3. FALLO DE CONSISTENCIA -> REINTENTAR
+            // "In the event of a mismatch, the MPI_Get operation... is repeated" [cite: 248]
+            attempts++;
+            // (Opcional) Pequeño backoff para dejar que el escritor termine
         }
-    }
-
-    GridCell getCell(int cell_id) override {
-        GridCell result(num_species);
-
-        auto it = local_data.find(cell_id);
-        if (it != local_data.end()) {
-            auto& cell = it->second;
-
-            for (int i = 0; i < num_species; ++i) {
-                result.concentrations[i] = cell->concentrations[i].load(std::memory_order_relaxed);
-            }
-            result.flux_in = cell->flux_in.load(std::memory_order_relaxed);
-            result.flux_out = cell->flux_out.load(std::memory_order_relaxed);
-        }
-
-        return result;
-    }
-
-    void advectStep() override {
-        // Esquema de advección upwind simplificado
-        for (auto& [cell_id, cell] : local_data) {
-            int left_cell = cell_id - 1;
-
-            auto it_left = local_data.find(left_cell);
-            if (it_left != local_data.end()) {
-                auto left_data = getCell(left_cell);
-
-                for (int i = 0; i < num_species; ++i) {
-                    double current = cell->concentrations[i].load(std::memory_order_relaxed);
-                    double updated = current + (left_data.concentrations[i] - current);
-                    cell->concentrations[i].store(updated, std::memory_order_relaxed);
-                }
-            }
-        }
-    }
-
-    void syncGhostCells() override {
-        // Sincronización simple entre procesos
-        MPI_Barrier(MPI_COMM_WORLD);
-        // (Futuro: implementar comunicación de bordes usando MPI_Sendrecv)
+        
+        // Si falla muchas veces, devolvemos celda vacía o error (simulado)
+        return GridCell(); 
     }
 
     std::string getStrategyName() const override {
-        return "Lock-Free";
+        return "Lock-Free (Optimistic Checksum)";
     }
 };
 

@@ -1,78 +1,115 @@
 #ifndef COARSE_GRAINED_HASH_TABLE_HPP
 #define COARSE_GRAINED_HASH_TABLE_HPP
 
-#include <unordered_map>
-#include <shared_mutex>
-#include <memory>
-#include <mpi.h>
-#include "distributed_hash_table.hpp"  // Contiene GridCell y DistributedHashTable
+#include "distributed_hash_table.hpp"
 
-// Implementación con bloqueo grueso (Coarse-Grained Locking)
 class CoarseGrainedHashTable : public DistributedHashTable {
-private:
-    std::unordered_map<int, GridCell> local_data;
-    std::shared_mutex global_mutex;
-    int rank, size;
-    int num_species;
-    int local_grid_size;
-
 public:
-    CoarseGrainedHashTable(int num_species, int total_cells, int rank, int size)
-        : num_species(num_species), rank(rank), size(size)
-    {
-        local_grid_size = total_cells / size;
+    CoarseGrainedHashTable(int total_entries, int rank, int size)
+        : DistributedHashTable(total_entries, rank, size) {}
 
-        std::unique_lock lock(global_mutex);
-        for (int i = 0; i < local_grid_size; ++i) {
-            int global_id = rank * local_grid_size + i;
-            local_data[global_id] = GridCell(num_species);
-        }
-    }
+    // Escritura Remota (Sección 3.1 del Paper)
+    void updateCell(int key, const GridCell& val) override {
+        int target_rank = getOwnerRank(key);
+        // Desplazamiento inicial (hash)
+        MPI_Aint target_offset = getLocalOffset(key);
+        
+        // 1. BLOQUEO GRUESO (The Bottleneck)
+        // "Whenever an DHT_read or DHT_write operation is initiated... 
+        // the entire memory window... is locked." [cite: 146-147]
+        // Usamos LOCK_EXCLUSIVE para escrituras.
+        MPI_Win_lock(MPI_LOCK_EXCLUSIVE, target_rank, 0, win);
 
-    void updateCell(int cell_id, const GridCell& new_data) override {
-        std::unique_lock lock(global_mutex);
-        auto it = local_data.find(cell_id);
-        if (it != local_data.end()) {
-            it->second = new_data;
-        }
-    }
+        DHT_Bucket temp;
+        bool written = false;
+        int attempts = 0;
+        const int MAX_ATTEMPTS = 50; // Evitar loop infinito si está lleno
 
-    GridCell getCell(int cell_id) override {
-        std::shared_lock lock(global_mutex);
-        auto it = local_data.find(cell_id);
-        if (it != local_data.end()) {
-            return it->second;
-        }
-        return GridCell(num_species);
-    }
+        // 2. COLLISION HANDLING (Linear Probing)
+        // "If the bucket is already occupied... the bucket at the next index is checked" [cite: 140]
+        while (attempts < MAX_ATTEMPTS) {
+            // Leemos el bucket remoto para ver su estado
+            MPI_Get(&temp, sizeof(DHT_Bucket), MPI_BYTE,
+                    target_rank, target_offset * sizeof(DHT_Bucket),
+                    sizeof(DHT_Bucket), MPI_BYTE, win);
+            
+            // Forzamos que la lectura termine antes de verificar (Flush local)
+            MPI_Win_flush(target_rank, win);
 
-    void advectStep() override {
-        std::unique_lock lock(global_mutex);
+            // Verificamos si podemos escribir aquí
+            if (temp.status == 0 || temp.key == key) {
+                // Preparamos el bucket a escribir
+                temp.key = key;
+                temp.value = val;
+                temp.status = 1; // Ocupado
 
-        // Copia temporal para evitar inconsistencias durante la iteración
-        auto temp_data = local_data;
-
-        for (auto& [cell_id, cell] : local_data) {
-            int left_cell = cell_id - 1;
-
-            auto it_left = temp_data.find(left_cell);
-            if (it_left != temp_data.end()) {
-                const auto& left_data = it_left->second;
-
-                for (int i = 0; i < num_species; ++i) {
-                    cell.concentrations[i] +=
-                        (left_data.concentrations[i] - cell.concentrations[i]);
-                }
+                // Escribimos (Remote Write)
+                MPI_Put(&temp, sizeof(DHT_Bucket), MPI_BYTE,
+                        target_rank, target_offset * sizeof(DHT_Bucket),
+                        sizeof(DHT_Bucket), MPI_BYTE, win);
+                
+                written = true;
+                break;
             }
+
+            // Colisión: Intentar siguiente slot
+            target_offset = (target_offset + 1) % local_capacity;
+            attempts++;
         }
+
+        // 3. DESBLOQUEO
+        // "The lock is released with MPI_Win_unlock" [cite: 149]
+        MPI_Win_unlock(target_rank, win);
     }
 
-    void syncGhostCells() override {
-        MPI_Barrier(MPI_COMM_WORLD);
+    // Lectura Remota
+    GridCell getCell(int key) override {
+        int target_rank = getOwnerRank(key);
+        MPI_Aint target_offset = getLocalOffset(key);
+        GridCell result; // Por defecto vacía
+
+        // Usamos LOCK_SHARED para lecturas (permite múltiples lectores) [cite: 148]
+        MPI_Win_lock(MPI_LOCK_SHARED, target_rank, 0, win);
+
+        DHT_Bucket temp;
+        int attempts = 0;
+        const int MAX_ATTEMPTS = 50;
+
+        while (attempts < MAX_ATTEMPTS) {
+            // Leer bucket remoto
+            MPI_Get(&temp, sizeof(DHT_Bucket), MPI_BYTE,
+                    target_rank, target_offset * sizeof(DHT_Bucket),
+                    sizeof(DHT_Bucket), MPI_BYTE, win);
+            
+            MPI_Win_flush(target_rank, win);
+
+            if (temp.status == 0) {
+                // Llegamos a un hueco vacío -> La clave no existe
+                break;
+            }
+            
+            if (temp.key == key) {
+                // ¡Encontrado!
+                result = temp.value;
+                break;
+            }
+
+            // Seguir buscando (Linear Probing)
+            target_offset = (target_offset + 1) % local_capacity;
+            attempts++;
+        }
+
+        MPI_Win_unlock(target_rank, win);
+        return result;
     }
 
     std::string getStrategyName() const override {
-        return "Coarse-Grained Locking";
+        return "Coarse-Grained (MPI_Win_lock)";
+    }
+
+    // Override: No usamos lock_all, así que solo sincronizamos con Barrier
+    void syncGhostCells() override {
+        MPI_Barrier(MPI_COMM_WORLD);
     }
 };
 
